@@ -21,7 +21,6 @@ logger = Logger(service="Minakata")
 SHOW_DOCS = os.environ.get("SHOW_API_DOCS", "true").lower() == "true"
 
 # 2. Initialize FastAPI
-# Use English for title and description to avoid Latin-1 encoding issues in some environments
 app = FastAPI(
     title="Minakata API",
     description="Integrated API for Minakata Project",
@@ -43,9 +42,24 @@ app.add_middleware(
 # 4. Middleware: Logging & Security
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    # --- [Path Normalization] ---
+    # パス末尾のスラッシュの有無による不一致を防ぐ
+    path = request.url.path.rstrip("/")
+    
     # Skip security for docs and health
-    exempt_paths = ["/api/v1/docs", "/api/v1/redoc", "/api/v1/openapi.json", "/health"]
-    if any(request.url.path == path for path in exempt_paths):
+    # 💡 修正: health_routerにprefixを付けるため、ここも合わせる
+    exempt_paths = [
+        "/api/v1/docs", 
+        "/api/v1/redoc", 
+        "/api/v1/openapi.json", 
+        "/api/v1/health"
+    ]
+    
+    if any(path == p.rstrip("/") for p in exempt_paths):
+        # 追跡IDだけはヘルスチェックでも生成しておく（ロギング用）
+        aws_context = request.scope.get("aws.context")
+        trace_id = aws_context.aws_request_id if aws_context else str(uuid.uuid4())
+        request.state.minakata_traceid = trace_id
         return await call_next(request)
 
     # --- [Security Check] ---
@@ -86,6 +100,7 @@ async def log_requests(request: Request, call_next):
     trace_id = aws_context.aws_request_id if aws_context else str(uuid.uuid4())
     request.state.minakata_traceid = trace_id
 
+    # Body capturing for logging
     body = ""
     if request.method in ["POST", "PUT", "PATCH"]:
         try:
@@ -118,7 +133,8 @@ async def log_requests(request: Request, call_next):
     return response
 
 # 5. Register Routers
-app.include_router(health_router)
+# 💡 修正: 他のルーターと同様に prefix="/api/v1" を追加
+app.include_router(health_router, prefix="/api/v1")
 app.include_router(gemini_router, prefix="/api/v1")
 app.include_router(lexique_router, prefix="/api/v1")
 app.include_router(corpus_router, prefix="/api/v1")

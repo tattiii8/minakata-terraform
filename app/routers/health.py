@@ -7,6 +7,10 @@ from botocore.exceptions import ClientError
 
 # main.pyと同じサービス名で子ロガーを作成
 logger = Logger(service="Minakata", child=True)
+
+# 💡 ルーター側のプレフィックスは空にするか、呼び出し側と合わせる
+# main.pyで app.include_router(health_router, prefix="/api/v1") とする場合、
+# ここを "/health" にすると、最終的なパスは "/api/v1/health" になります。
 router = APIRouter(tags=["system"])
 
 # S3設定
@@ -15,14 +19,20 @@ s3 = boto3.client("s3")
 
 # 環境変数の取得（起動時に厳格にチェック）
 try:
-    EXPECTED_KEY = os.environ["X_MINAKATA_KEY"]
+    EXPECTED_KEY = os.environ.get("X_MINAKATA_KEY")
+    if not EXPECTED_KEY:
+        logger.warning("環境変数 'X_MINAKATA_KEY' が空です。")
 except KeyError:
     logger.critical("環境変数 'X_MINAKATA_KEY' が設定されていません。")
     EXPECTED_KEY = None
 
 @router.get("/health")
 async def health_check(request: Request, x_minakata_key: str = Header(None)):
-    # 1. ミドルウェアから trace_id を取得
+    """
+    システムの健全性を確認するエンドポイント。
+    実際のパスは main.py の include_router 設定に依存します（例: /api/v1/health）。
+    """
+    # 1. ミドルウェアから trace_id を取得（ミドルウェアを通過しない場合は "unknown"）
     trace_id = getattr(request.state, "minakata_traceid", "unknown")
 
     # 2. 環境変数の存在確認
@@ -48,12 +58,13 @@ async def health_check(request: Request, x_minakata_key: str = Header(None)):
     health_status = {
         "status": "healthy",
         "service": "Minakata",
-        "minakata_traceid": trace_id, # レスポンスにも含める
+        "minakata_traceid": trace_id,
         "timestamp": datetime.now().isoformat(),
         "details": {}
     }
 
     try:
+        # 実際にS3への接続権限があるか確認
         s3.head_bucket(Bucket=S3_BUCKET_NAME)
         health_status["details"]["storage"] = {
             "status": "accessible",
@@ -61,8 +72,12 @@ async def health_check(request: Request, x_minakata_key: str = Header(None)):
         }
         logger.info("Health check passed", extra={"minakata_traceid": trace_id})
     except ClientError as e:
-        logger.error(f"S3 health check failed: {e}", extra={"minakata_traceid": trace_id})
+        logger.error(f"S3 health check failed: {str(e)}", extra={"minakata_traceid": trace_id})
         health_status["status"] = "unhealthy"
         health_status["details"]["storage"] = {"status": "error", "message": str(e)}
+    except Exception as e:
+        logger.error(f"Unexpected health check error: {str(e)}", extra={"minakata_traceid": trace_id})
+        health_status["status"] = "error"
+        health_status["details"]["storage"] = {"status": "critical_error", "message": str(e)}
 
     return health_status
