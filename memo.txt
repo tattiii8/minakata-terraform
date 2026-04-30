@@ -1,0 +1,3 @@
+curl -i -X POST "https://minakata.lesure.net/api/v1/corpus/index"
+
+curl -i -G --data-urlencode "q=キリスト教" "https://minakata.lesure.net/api/v1/corpus/search"

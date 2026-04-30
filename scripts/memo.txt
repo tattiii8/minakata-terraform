@@ -1,0 +1,3 @@
+curl -s https://minakata.lesure.net/api/v1/management/lexique/trace/{}
+
+curl -s -X POST https://minakata.lesure.net/api/v1/lexique -H "Content-Type: application/json" -d '{"lexique":"ensemble"}' | jq
