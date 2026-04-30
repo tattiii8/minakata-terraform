@@ -12,7 +12,6 @@ resource "aws_s3_bucket" "cf_logs" {
   bucket = "${var.project_name}-cloudfront-logs"
 }
 
-# CloudFrontがログを書き込めるように所有権を設定
 resource "aws_s3_bucket_ownership_controls" "cf_logs" {
   bucket = aws_s3_bucket.cf_logs.id
   rule {
@@ -26,7 +25,8 @@ resource "aws_s3_bucket_acl" "cf_logs_acl" {
   acl        = "private"
 }
 
-# --- 2. CloudFront Function (署名・ヘッダー付与・デバッグログ) ---
+# --- 2. CloudFront Function (防御 + 署名・ヘッダー付与) ---
+# WAFを使わず、低コストでスキャンをブロックします
 resource "aws_cloudfront_function" "add_custom_header" {
   name    = "${var.project_name}-edge-function"
   runtime = "cloudfront-js-2.0"
@@ -34,20 +34,35 @@ resource "aws_cloudfront_function" "add_custom_header" {
   code    = <<-EOT
     function handler(event) {
         var request = event.request;
+        var uri = request.uri;
         var clientIP = event.viewer.ip;
+
+        // --- 防御ロジック: 不審なスキャンの即時拒否 ---
+        // .env, .git, .php などのドットファイルや、特定の拡張子を狙ったアクセスをブロック
+        if (uri.includes('/.') || uri.endsWith('.env')) {
+            console.log("Blocked Scan Attempt: URL=" + uri + " IP=" + clientIP);
+            return {
+                statusCode: 403,
+                statusDescription: 'Forbidden',
+                headers: {
+                    'content-type': { value: 'text/plain' }
+                },
+                body: 'Access Denied: Unallowed path'
+            };
+        }
+
+        // --- 署名・ヘッダー付与ロジック ---
         var secretKey = "${var.x_minakata_header_secret}";
-        var timestamp = Math.floor(Date.now() / 1000); // 秒単位
+        var timestamp = Math.floor(Date.now() / 1000);
     
-        // 署名の生成
         var signature = btoa(timestamp + "." + secretKey);
         
-        // オリジン（API Gateway）に送るリクエストにヘッダーを追加
         request.headers['x-minakata-header']    = { value: 'true' };
         request.headers['x-minakata-signature'] = { value: signature };
         request.headers['x-minakata-timestamp'] = { value: timestamp.toString() };
 
-        // 実行ログを出力 (各リージョンのCloudWatch Logsへ)
-        console.log("Edge Auth Trace: URL=" + request.uri + " IP=" + clientIP + " TS=" + timestamp);
+        // 正常なリクエストのログ（CloudWatch Logsへ）
+        console.log("Edge Auth Trace: URL=" + uri + " IP=" + clientIP + " TS=" + timestamp);
         
         return request;
     }
@@ -69,13 +84,12 @@ resource "aws_acm_certificate" "cloudfront_cert" {
   }
 }
 
-# --- 4. CloudFront Distribution (ログ出力設定込み) ---
+# --- 4. CloudFront Distribution ---
 resource "aws_cloudfront_distribution" "api_dist" {
   enabled         = true
   is_ipv6_enabled = true
   aliases         = [local.full_domain_name]
 
-  # S3へのアクセスログ配信設定
   logging_config {
     include_cookies = false
     bucket          = aws_s3_bucket.cf_logs.bucket_domain_name
@@ -104,6 +118,7 @@ resource "aws_cloudfront_distribution" "api_dist" {
     allowed_methods = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
     cached_methods  = ["GET", "HEAD"]
 
+    # エッジ関数を紐付け
     function_association {
       event_type   = "viewer-request"
       function_arn = aws_cloudfront_function.add_custom_header.arn
@@ -111,7 +126,10 @@ resource "aws_cloudfront_distribution" "api_dist" {
   }
 
   restrictions {
-    geo_restriction { restriction_type = "none" }
+    # 海外からのスキャンが多すぎる場合は、ここを "whitelist" にして ["JP"] を指定してください
+    geo_restriction {
+      restriction_type = "none"
+    }
   }
 
   viewer_certificate {
